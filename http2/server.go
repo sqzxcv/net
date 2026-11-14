@@ -1730,7 +1730,17 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 	if len(sc.streams) == 0 {
 		sc.setConnState(http.StateIdle)
 		if sc.srv.IdleTimeout > 0 && sc.idleTimer != nil {
-			sc.idleTimer.Reset(sc.srv.IdleTimeout)
+			select {
+			case <-sc.doneServing:
+				// serve() has returned and closeAllStreamsOnConnClose is
+				// closing the streams the peer left open. serve's deferred
+				// idleTimer.Stop has already run, so re-arming here would keep
+				// the whole serverConn (framer buffers, hpack tables, conn)
+				// reachable from the timer for IdleTimeout after the
+				// connection is gone.
+			default:
+				sc.idleTimer.Reset(sc.srv.IdleTimeout)
+			}
 		}
 		if h1ServerKeepAlivesDisabled(sc.hs) {
 			sc.startGracefulShutdownInternal()
