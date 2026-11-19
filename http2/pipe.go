@@ -77,6 +77,44 @@ func (p *pipe) Read(d []byte) (n int, err error) {
 	}
 }
 
+// readLazy is Read with a destination buffer that is obtained only once there
+// is data to copy: it waits exactly like Read, and when data is buffered it
+// calls get and copies into the returned slice in the same critical section,
+// at the same moment Read would have copied, so for the same buffered data it
+// returns the same bytes. get is not called when Read would have returned an
+// error, so the returned buffer is nil then.
+//
+// get runs with p.mu held and must not block or call back into the pipe.
+//
+// netun fork addition, used by requestBody.ReadLazy.
+func (p *pipe) readLazy(get func() []byte) (d []byte, n int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.c.L == nil {
+		p.c.L = &p.mu
+	}
+	// The loop is Read's, with d supplied by get at the copy.
+	for {
+		if p.breakErr != nil {
+			return nil, 0, p.breakErr
+		}
+		if p.b != nil && p.b.Len() > 0 {
+			d = get()
+			n, err = p.b.Read(d)
+			return d, n, err
+		}
+		if p.err != nil {
+			if p.readFn != nil {
+				p.readFn()     // e.g. copy trailers
+				p.readFn = nil // not sticky like p.err
+			}
+			p.b = nil
+			return nil, 0, p.err
+		}
+		p.c.Wait()
+	}
+}
+
 var (
 	errClosedPipeWrite        = errors.New("write on closed buffer")
 	errUninitializedPipeWrite = errors.New("write on uninitialized buffer")

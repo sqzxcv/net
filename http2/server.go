@@ -2613,6 +2613,45 @@ func (b *requestBody) Close() error {
 	return nil
 }
 
+// ReadLazy is Read for a caller that does not want to hold a read buffer while
+// the stream is idle. It blocks exactly like Read; once body data is buffered it
+// calls get for the destination and copies into it at the moment Read would
+// have, returning the slice get returned (nil when no data was copied, which is
+// whenever Read would have returned 0 bytes with an error).
+//
+// The copy happens at the same point, under the same lock, as in Read, so for
+// the same buffered data it returns the same bytes and the flow-control
+// accounting is unchanged. (Waiting first and calling Read afterwards would
+// not: the extra time between wake-up and copy lets the next DATA frame land,
+// which systematically merges reads and so changes the WINDOW_UPDATE frames the
+// peer sees.) A proxy relaying thousands of mostly idle streams uses it to
+// borrow a pooled buffer per read instead of keeping one per stream.
+//
+// get is called with the body's internal lock held: it must be quick and must
+// not block or touch the request body. Like Read, ReadLazy must not be called
+// concurrently with Read; Close may be called concurrently and wakes it.
+//
+// netun fork addition, not in upstream x/net. requestBody is unexported, so
+// callers reach it with an interface assertion on http.Request.Body.
+func (b *requestBody) ReadLazy(get func() []byte) (p []byte, n int, err error) {
+	if b.needsContinue {
+		b.needsContinue = false
+		b.conn.write100ContinueHeaders(b.stream)
+	}
+	if b.pipe == nil || b.sawEOF {
+		return nil, 0, io.EOF
+	}
+	p, n, err = b.pipe.readLazy(get)
+	if err == io.EOF {
+		b.sawEOF = true
+	}
+	if b.conn == nil && inTests {
+		return
+	}
+	b.conn.noteBodyReadFromHandler(b.stream, n, err)
+	return
+}
+
 func (b *requestBody) Read(p []byte) (n int, err error) {
 	if b.needsContinue {
 		b.needsContinue = false
